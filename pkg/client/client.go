@@ -34,3 +34,13 @@ type (
 )
 
 var NewClient = is.NewClient
+
+// ConnectToSocket creates a TUIClient and connects to a daemon at a specific socket path.
+// This allows callers to specify a custom socket path instead of using the default.
+func ConnectToSocket(socketPath, version string, width, height int) (*TUIClient, error) {
+	client := NewTUIClient()
+	if err := client.ConnectToSocket(socketPath, version, width, height); err != nil {
+		return nil, err
+	}
+	return client, nil
+}
