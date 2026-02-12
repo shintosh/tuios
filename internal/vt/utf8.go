@@ -85,10 +85,21 @@ func (e *Emulator) handleGrapheme(content string, width int) {
 		e.lastChar, _ = utf8.DecodeRuneInString(content)
 	}
 
+	// If a wide character doesn't fit in the remaining columns, wrap to the
+	// next line before placing it. This prevents ultraviolet from truncating
+	// the character to blanks and ensures correct line-wrap behavior.
+	if awm && cell.Width > 1 && x+cell.Width > e.scr.Width() {
+		e.index()
+		_, y = e.scr.CursorPosition()
+		x = 0
+	}
+
 	e.scr.SetCell(x, y, &cell)
 
-	// Handle phantom state at the end of the line
-	e.atPhantom = awm && x >= e.scr.Width()-1
+	// Handle phantom state at the end of the line. Account for the cell's
+	// full width: a width-2 char at x=78 in an 80-col terminal fills the
+	// line completely and should trigger phantom (pending wrap) state.
+	e.atPhantom = awm && x+cell.Width >= e.scr.Width()
 	if !e.atPhantom {
 		x += cell.Width
 	}

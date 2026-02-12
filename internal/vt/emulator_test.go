@@ -527,6 +527,122 @@ func TestEmulator_ProgressBarSimulation(t *testing.T) {
 }
 
 // =============================================================================
+// Wide Character / Phantom State Tests
+// =============================================================================
+
+func TestEmulator_WideCharPhantomState(t *testing.T) {
+	// In an 80-column terminal, a width-2 character placed at column 78
+	// (0-indexed) fills columns 78-79. The emulator should enter phantom
+	// (pending wrap) state so the next character wraps to the next line.
+	emu := vt.NewEmulator(80, 24)
+
+	// Fill columns 0-77 with 'A' (78 characters), then write a wide char.
+	line := strings.Repeat("A", 78) + "世" // 世 is width-2
+	_, err := emu.Write([]byte(line))
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// The wide char should be at position (78, 0) with width 2.
+	cell := emu.CellAt(78, 0)
+	if cell == nil || cell.Content != "世" {
+		t.Fatalf("Expected wide char at (78,0), got %+v", cell)
+	}
+
+	// Now write a normal ASCII char - it should wrap to (0, 1).
+	_, err = emu.Write([]byte("B"))
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	cell = emu.CellAt(0, 1)
+	if cell == nil || cell.Content != "B" {
+		t.Errorf("Expected 'B' at (0,1) after wrap, got %+v", cell)
+	}
+
+	// The wide char placeholder at (79, 0) should NOT have been overwritten.
+	cell = emu.CellAt(79, 0)
+	if cell != nil && cell.Width != 0 {
+		t.Errorf("Expected placeholder (width 0) at (79,0), got width=%d content=%q", cell.Width, cell.Content)
+	}
+}
+
+func TestEmulator_WideCharOverflowWraps(t *testing.T) {
+	// When a width-2 character is placed at the last column (79 in 80-col),
+	// there's only 1 column remaining - not enough for a width-2 char.
+	// The emulator should wrap to the next line and place it at column 0.
+	emu := vt.NewEmulator(80, 24)
+
+	// Fill columns 0-78 with 'A' (79 characters), leaving only column 79.
+	line := strings.Repeat("A", 79) + "世"
+	_, err := emu.Write([]byte(line))
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// The wide char should NOT be at (79, 0) - it doesn't fit there.
+	// It should have wrapped to (0, 1).
+	cell := emu.CellAt(0, 1)
+	if cell == nil || cell.Content != "世" {
+		t.Errorf("Expected wide char at (0,1) after overflow wrap, got %+v", cell)
+	}
+
+	// Position (79, 0) should be empty (the last col of the first line).
+	cell = emu.CellAt(79, 0)
+	if cell != nil && cell.Content != "" && cell.Content != " " {
+		t.Errorf("Expected empty cell at (79,0), got %+v", cell)
+	}
+}
+
+func TestEmulator_WideCharSequence(t *testing.T) {
+	// Fill a line with alternating wide chars. In 80 cols, we can fit
+	// 40 width-2 characters per line.
+	emu := vt.NewEmulator(80, 24)
+
+	// Write 41 wide chars - 40 fit on line 0, 1 wraps to line 1.
+	input := strings.Repeat("世", 41)
+	_, err := emu.Write([]byte(input))
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// Check the last wide char on line 0 is at position 78.
+	cell := emu.CellAt(78, 0)
+	if cell == nil || cell.Content != "世" {
+		t.Errorf("Expected wide char at (78,0), got %+v", cell)
+	}
+
+	// The 41st wide char should be at (0, 1).
+	cell = emu.CellAt(0, 1)
+	if cell == nil || cell.Content != "世" {
+		t.Errorf("Expected wide char at (0,1), got %+v", cell)
+	}
+}
+
+func TestEmulator_WideCharCursorPosition(t *testing.T) {
+	// After writing a wide char that fills the last two columns, the cursor
+	// should be in phantom state. We verify by checking that the next char
+	// goes to the next line.
+	emu := vt.NewEmulator(10, 5) // Small terminal for clarity
+
+	// Fill 8 cols then write a width-2 char to fill cols 8-9.
+	_, _ = emu.Write([]byte("AAAAAAAA世"))
+
+	// Cursor should be at position 8 (phantom state, stays at write pos).
+	pos := emu.CursorPosition()
+	if pos.X != 8 || pos.Y != 0 {
+		t.Errorf("Expected cursor at (8,0) in phantom state, got (%d,%d)", pos.X, pos.Y)
+	}
+
+	// Next char should trigger wrap.
+	_, _ = emu.Write([]byte("X"))
+	pos = emu.CursorPosition()
+	if pos.Y != 1 {
+		t.Errorf("Expected cursor on line 1 after wrap, got line %d", pos.Y)
+	}
+}
+
+// =============================================================================
 // Benchmarks
 // =============================================================================
 
