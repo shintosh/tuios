@@ -37,11 +37,17 @@
 package tuios
 
 import (
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+
 	tea "charm.land/bubbletea/v2"
 	"github.com/Gaurav-Gosain/tuios/internal/app"
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 	"github.com/Gaurav-Gosain/tuios/internal/input"
-	"github.com/Gaurav-Gosain/tuios/internal/theme"
+	"github.com/Gaurav-Gosain/tuios/internal/session"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
 )
 
 // Model is the main TUIOS model that implements tea.Model.
@@ -101,6 +107,30 @@ type Options struct {
 
 	// SSHMode indicates if running over SSH.
 	SSHMode bool
+
+	// DaemonSocketPath is the path to the TUIOS daemon Unix socket.
+	// When set, the TUIOS app connects to the daemon for PTY management.
+	DaemonSocketPath string
+
+	// SessionName is the daemon session name to create or attach to.
+	SessionName string
+
+	// EnableGraphicsPassthrough enables Kitty/Sixel graphics passthrough.
+	// Should be true for terminal sessions, false for web sessions.
+	EnableGraphicsPassthrough bool
+
+	// HideClock hides the clock from the dockbar.
+	HideClock bool
+
+	// WindowTitlePosition sets the window title position.
+	// Valid values: "left", "center", "right"
+	WindowTitlePosition string
+
+	// NoAnimations disables all UI animations.
+	NoAnimations bool
+
+	// Version is the version string sent during daemon handshake.
+	Version string
 
 	// UserConfig is a custom user configuration. If nil, defaults are used.
 	UserConfig *config.UserConfig
@@ -197,6 +227,55 @@ func WithSSHMode(enabled bool) Option {
 	}
 }
 
+// WithDaemonSocket sets the daemon socket path for PTY management.
+func WithDaemonSocket(path string) Option {
+	return func(o *Options) {
+		o.DaemonSocketPath = path
+	}
+}
+
+// WithSessionName sets the daemon session name.
+func WithSessionName(name string) Option {
+	return func(o *Options) {
+		o.SessionName = name
+	}
+}
+
+// WithGraphicsPassthrough enables Kitty/Sixel graphics passthrough.
+func WithGraphicsPassthrough(enabled bool) Option {
+	return func(o *Options) {
+		o.EnableGraphicsPassthrough = enabled
+	}
+}
+
+// WithHideClock hides the clock from the dockbar.
+func WithHideClock(hide bool) Option {
+	return func(o *Options) {
+		o.HideClock = hide
+	}
+}
+
+// WithWindowTitlePosition sets the window title position.
+func WithWindowTitlePosition(position string) Option {
+	return func(o *Options) {
+		o.WindowTitlePosition = position
+	}
+}
+
+// WithNoAnimations disables all UI animations.
+func WithNoAnimations(enabled bool) Option {
+	return func(o *Options) {
+		o.NoAnimations = enabled
+	}
+}
+
+// WithVersion sets the version string for daemon handshake.
+func WithVersion(version string) Option {
+	return func(o *Options) {
+		o.Version = version
+	}
+}
+
 // WithUserConfig sets a custom user configuration.
 func WithUserConfig(cfg *config.UserConfig) Option {
 	return func(o *Options) {
@@ -250,30 +329,76 @@ func newModel(options Options) *Model {
 	// Set up input handler
 	app.SetInputHandler(input.HandleInput)
 
-	// Apply global config options
-	if options.ASCIIOnly {
-		config.UseASCIIOnly = true
+	// Load or create user config
+	var userConfig *config.UserConfig
+	if options.UserConfig != nil {
+		userConfig = options.UserConfig
+	} else {
+		var err error
+		userConfig, err = config.LoadUserConfig()
+		if err != nil {
+			userConfig = config.DefaultConfig()
+		}
 	}
-	if options.BorderStyle != "" {
-		config.BorderStyle = options.BorderStyle
-	}
-	if options.DockbarPosition != "" {
-		config.DockbarPosition = options.DockbarPosition
-	}
-	if options.HideWindowButtons {
-		config.HideWindowButtons = true
-	}
-	if options.ScrollbackLines > 0 {
-		config.ScrollbackLines = options.ScrollbackLines
-	}
+
+	// Apply overrides using the central config system
+	config.ApplyOverrides(config.Overrides{
+		ASCIIOnly:           options.ASCIIOnly,
+		BorderStyle:         options.BorderStyle,
+		DockbarPosition:     options.DockbarPosition,
+		HideWindowButtons:   options.HideWindowButtons,
+		WindowTitlePosition: options.WindowTitlePosition,
+		HideClock:           options.HideClock,
+		ScrollbackLines:     options.ScrollbackLines,
+		NoAnimations:        options.NoAnimations,
+		ThemeName:           options.Theme,
+	}, userConfig)
+
+	// Backwards compat: handle Animations=false (old API)
 	if !options.Animations {
 		config.AnimationsEnabled = false
 	}
 
-	// Initialize theme
-	if options.Theme != "" {
-		_ = theme.Initialize(options.Theme)
+	// Create keybind registry
+	keybindRegistry := config.NewKeybindRegistry(userConfig)
+
+	// Determine if this is a daemon session
+	isDaemonSession := options.DaemonSocketPath != ""
+
+	// Create the model using the factory function
+	return app.NewOS(app.OSOptions{
+		KeybindRegistry:          keybindRegistry,
+		ShowKeys:                 options.ShowKeys,
+		NumWorkspaces:            options.Workspaces,
+		Width:                    options.Width,
+		Height:                   options.Height,
+		IsSSHMode:                options.SSHMode,
+		IsDaemonSession:          isDaemonSession,
+		SessionName:              options.SessionName,
+		EnableGraphicsPassthrough: options.EnableGraphicsPassthrough,
+	})
+}
+
+// Run creates and runs a full TUIOS TUI application, blocking until exit.
+// This is the main entry point for running TUIOS as a standalone process.
+// It handles daemon connection, signal handling, and terminal cleanup.
+//
+// Usage from shinto:
+//
+//	err := tuios.Run(
+//		tuios.WithDaemonSocket("/tmp/tuios.sock"),
+//		tuios.WithSessionName("main"),
+//		tuios.WithGraphicsPassthrough(true),
+//		tuios.WithTheme("dracula"),
+//	)
+func Run(opts ...Option) error {
+	options := DefaultOptions()
+	for _, opt := range opts {
+		opt(&options)
 	}
+
+	// Set up input handler
+	app.SetInputHandler(input.HandleInput)
 
 	// Load or create user config
 	var userConfig *config.UserConfig
@@ -287,18 +412,82 @@ func newModel(options Options) *Model {
 		}
 	}
 
-	// Create keybind registry
+	// Apply overrides using the central config system
+	config.ApplyOverrides(config.Overrides{
+		ASCIIOnly:           options.ASCIIOnly,
+		BorderStyle:         options.BorderStyle,
+		DockbarPosition:     options.DockbarPosition,
+		HideWindowButtons:   options.HideWindowButtons,
+		WindowTitlePosition: options.WindowTitlePosition,
+		HideClock:           options.HideClock,
+		ScrollbackLines:     options.ScrollbackLines,
+		NoAnimations:        options.NoAnimations,
+		ThemeName:           options.Theme,
+	}, userConfig)
+
+	if !options.Animations {
+		config.AnimationsEnabled = false
+	}
+
 	keybindRegistry := config.NewKeybindRegistry(userConfig)
 
-	// Create the model using the factory function
-	return app.NewOS(app.OSOptions{
-		KeybindRegistry: keybindRegistry,
-		ShowKeys:        options.ShowKeys,
-		NumWorkspaces:   options.Workspaces,
-		Width:           options.Width,
-		Height:          options.Height,
-		IsSSHMode:       options.SSHMode,
-	})
+	isDaemonSession := options.DaemonSocketPath != ""
+
+	osOpts := app.OSOptions{
+		KeybindRegistry:          keybindRegistry,
+		ShowKeys:                 options.ShowKeys,
+		NumWorkspaces:            options.Workspaces,
+		Width:                    options.Width,
+		Height:                   options.Height,
+		IsSSHMode:                options.SSHMode,
+		IsDaemonSession:          isDaemonSession,
+		SessionName:              options.SessionName,
+		EnableGraphicsPassthrough: options.EnableGraphicsPassthrough,
+	}
+
+	// Connect to daemon if socket path is provided
+	if isDaemonSession {
+		client := session.NewTUIClient()
+		ver := options.Version
+		if ver == "" {
+			ver = "embedded"
+		}
+		if err := client.ConnectToSocket(options.DaemonSocketPath, ver, options.Width, options.Height); err != nil {
+			return fmt.Errorf("failed to connect to daemon: %w", err)
+		}
+		osOpts.DaemonClient = client
+	}
+
+	model := app.NewOS(osOpts)
+
+	p := tea.NewProgram(
+		model,
+		tea.WithFPS(config.NormalFPS),
+		tea.WithoutSignalHandler(),
+		tea.WithFilter(FilterMouseMotion),
+	)
+
+	// Handle signals for clean shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		p.Send(tea.QuitMsg{})
+	}()
+
+	finalModel, err := p.Run()
+
+	if finalOS, ok := finalModel.(*app.OS); ok {
+		finalOS.Cleanup()
+	}
+
+	terminal.ResetTerminal()
+
+	if err != nil {
+		return fmt.Errorf("tuios error: %w", err)
+	}
+
+	return nil
 }
 
 // ProgramOptions returns recommended tea.ProgramOption values for running TUIOS.
