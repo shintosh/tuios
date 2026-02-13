@@ -446,6 +446,7 @@ func Run(opts ...Option) error {
 	}
 
 	// Connect to daemon if socket path is provided
+	var daemonState *session.SessionState
 	if isDaemonSession {
 		client := session.NewTUIClient()
 		ver := options.Version
@@ -455,10 +456,41 @@ func Run(opts ...Option) error {
 		if err := client.ConnectToSocket(options.DaemonSocketPath, ver, options.Width, options.Height); err != nil {
 			return fmt.Errorf("failed to connect to daemon: %w", err)
 		}
+
+		// Attach to the daemon session (required before any PTY operations)
+		sessionName := options.SessionName
+		if sessionName == "" {
+			sessionName = "main"
+		}
+		state, err := client.AttachSession(sessionName, true, options.Width, options.Height)
+		if err != nil {
+			_ = client.Close()
+			return fmt.Errorf("failed to attach to session: %w", err)
+		}
+		daemonState = state
+
+		// Start the read loop for receiving async messages (PTY output, events)
+		client.StartReadLoop()
+
 		osOpts.DaemonClient = client
+		osOpts.SessionName = client.SessionName()
 	}
 
 	model := app.NewOS(osOpts)
+
+	// Restore existing session state from daemon (windows, layouts, etc.)
+	if daemonState != nil && len(daemonState.Windows) > 0 {
+		if err := model.RestoreFromState(daemonState); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to restore session state: %v\n", err)
+		}
+		if err := model.RestoreTerminalStates(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to restore terminal states: %v\n", err)
+		}
+		if err := model.SetupPTYOutputHandlers(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to set up PTY handlers: %v\n", err)
+		}
+		model.SyncDaemonPTYDimensions()
+	}
 
 	p := tea.NewProgram(
 		model,
